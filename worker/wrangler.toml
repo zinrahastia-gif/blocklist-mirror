@@ -16,10 +16,11 @@ binding = "STATE"
 id = "af3c0d930fdb4ae5b141042327fd7340"
 
 [vars]
-GITHUB_REPO = "YOURUSER/YOURREPO"
-# Where the public files are served from. GitHub Releases needs no card and is
-# free for public repos, so it replaces R2 entirely for this project.
-PUBLIC_BASE = "https://github.com/YOURUSER/YOURREPO/releases/download/blocklist"
+GITHUB_REPO = "zinrahastia-gif/blocklist-mirror"
+# GitHub Releases layout: <base>/<tag>/<asset>. The tag IS the version id, and
+# `gh release create --latest` keeps a moving "latest" tag alongside it, so
+# consumers can pin a build or always follow the newest one.
+PUBLIC_BASE = "https://github.com/zinrahastia-gif/blocklist-mirror/releases/download"
 
 # Set these as secrets, never here:
 #   npx wrangler secret put GITHUB_TOKEN     # fine-grained PAT, Contents: read+write

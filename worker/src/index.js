@@ -110,7 +110,7 @@ export default {
     }
 
     if (url.pathname === "/published" && request.method === "POST") {
-      // Called by the build job after R2 upload so /latest can redirect.
+      // Called by the build job after the release upload so /latest can redirect.
       const auth = request.headers.get("Authorization") || "";
       if (!env.WORKER_SECRET || auth !== `Bearer ${env.WORKER_SECRET}`) {
         return Response.json({ error: "unauthorized" }, { status: 401 });
@@ -123,13 +123,16 @@ export default {
         at: new Date().toISOString(),
       };
       if (env.PUBLIC_BASE && body.version) {
-        // Keep the immutable object URL so /latest is a pure redirect.
-        state.publishedUrl = `${env.PUBLIC_BASE}/blocklist/versions/${body.version}.csv.zst`;
-        // A versioned alias is easier for consumers than pinning the hash.
-        state.latestUrl = `${env.PUBLIC_BASE}/blocklist/latest.csv.zst`;
+        // GitHub Releases layout: the asset is attached to a tag, so the URL is
+        // <base>/<version>/<file>. PUBLIC_BASE must therefore be
+        // https://github.com/OWNER/REPO/releases/download with no trailing tag.
+        state.publishedUrl = `${env.PUBLIC_BASE}/${body.version}/${body.version}.csv.zst`;
+        // The "latest" release is a moving alias maintained by `gh --latest`.
+        state.latestUrl = `${env.PUBLIC_BASE}/latest/${body.version}.csv.zst`;
       }
       await env.STATE.put(STATE_KEY, JSON.stringify(state));
-      return Response.json({ ok: true, published: state.published });
+      return Response.json({ ok: true, published: state.published, urls: {
+        pinned: state.publishedUrl, latest: state.latestUrl } });
     }
 
     if (url.pathname === "/status") {
