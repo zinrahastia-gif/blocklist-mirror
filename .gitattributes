@@ -1,0 +1,20 @@
+# Normalise line endings. The build workflow runs under bash on ubuntu-latest,
+# and a CRLF shebang or a CRLF-terminated `\` continuation breaks there in ways
+# that are painful to debug (the backslash stops escaping the newline).
+# Force LF for everything that gets executed or parsed.
+* text=auto eol=lf
+
+*.yml text eol=lf
+*.yaml text eol=lf
+*.py text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.sh text eol=lf
+*.json text eol=lf
+
+# Binary assets must never be line-ending converted.
+*.zst binary
+*.png binary
+*.ico binary

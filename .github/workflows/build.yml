@@ -1,0 +1,128 @@
+name: Build blocklist
+
+# Triggered three ways, none of them the unreliable `schedule:` path:
+#   repository_dispatch - fired by the Cloudflare Worker within ~5 min of a
+#                         change (the fast path you asked for)
+#   workflow_dispatch   - manual "Run workflow" button
+# A fallback cron is intentionally NOT used: measured on the upstream repo,
+# `schedule: '0 * * * *'` actually fired every 2.4-7.7h (mean 5.1h), so it
+# cannot meet a 3-5 minute freshness target and only adds false confidence.
+on:
+  repository_dispatch:
+    types: [blocklist-update]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: blocklist-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install zstd binding
+        run: pip install --quiet zstandard
+
+      # Restore the previous snapshot before building. GitHub-hosted runners are
+      # ephemeral, so out/ starts empty on every run; without this the diff has
+      # no base and versions.json resets to one entry each time. Pulling the
+      # previous release's newest snapshot restores both, at the cost of a
+      # ~40 MB download that is dwarfed by the 224 MB source fetch.
+      - name: Restore previous state
+        continue-on-error: true        # first ever run has no release to restore
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p out/blocklist/versions
+          tag=$(gh release list --limit 1 --json tagName --jq '.[0].tagName' 2>/dev/null || true)
+          if [ -z "$tag" ] || [ "$tag" = "null" ]; then
+            echo "no previous release yet - this is the first build"
+            exit 0
+          fi
+          echo "restoring state from $tag"
+          gh release download "$tag" --pattern '*.csv.zst' --dir out/blocklist/versions/
+          gh release download "$tag" --pattern 'versions.json' --dir out/blocklist/ --clobber
+          echo "restored:"; ls -la out/blocklist/versions/ out/blocklist/*.json 2>/dev/null || true
+
+      - name: Report trigger
+        run: |
+          echo "event=${{ github.event_name }}"
+          echo "trigger=${{ github.event.client_payload.trigger }}"
+          echo "started=$(date -u +%FT%TZ)"
+          echo "::notice title=Build started::$(date -u +%T) UTC"
+
+      - name: Build from the unmasked source
+        run: |
+          python build.py \
+            --source "https://github.com/Skiddle-ID/blocklist/releases/download/latest/domains.txt" \
+            --label "github release domains.txt"
+
+      # Publish to GitHub Releases, not R2. R2 requires a payment card on the
+      # account even for the free tier (verified: the API returns code 10042
+      # "Please enable R2 through the Cloudflare Dashboard" for this account),
+      # while Releases needs no card and has no bandwidth limit. Each file must
+      # be under 2 GiB and a release may hold up to 1000 assets, both far above
+      # the 40 MB snapshot this produces.
+      - name: Publish release
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd out
+          VERSION=$(python -c "import json;print(json.load(open('blocklist/latest.json'))['version'])")
+          TOTAL=$(python -c "import json;print(json.load(open('blocklist/latest.json'))['total_domains'])")
+          echo "publishing $VERSION ($TOTAL domains)"
+
+          # The snapshot is the one asset that must be reachable by URL. The
+          # manifests are small and go alongside, so a consumer can pin either
+          # a versioned file or follow "latest".
+          # Idempotent: a rebuild of an unchanged source yields the SAME version
+          # id (the id is the hash of the compressed bytes), so `gh release
+          # create` would fail with "tag already exists" on every duplicate run.
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "release $VERSION already exists - re-uploading assets"
+            gh release upload "$VERSION" \
+              "blocklist/versions/$VERSION.csv.zst" \
+              blocklist/latest.json \
+              blocklist/versions.json \
+              --clobber
+          else
+            gh release create "$VERSION" \
+              "blocklist/versions/$VERSION.csv.zst" \
+              blocklist/latest.json \
+              blocklist/versions.json \
+              --title "$VERSION ($TOTAL domains)" \
+              --notes "Blocklist $VERSION
+
+          * domains: $TOTAL
+          * source: Skiddle-ID/blocklist release (unmasked Komdigi mirror)
+          * file: $VERSION.csv.zst (zstd-compressed, newline-delimited, sorted, unique)" \
+              --latest
+          fi
+
+      - name: Tell the Worker what went live
+        if: success()
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          WORKER_SECRET: ${{ secrets.WORKER_SECRET }}
+        run: |
+          set -euo pipefail
+          VERSION=$(python -c "import json;print(json.load(open('out/blocklist/latest.json'))['version'])")
+          TOTAL=$(python -c "import json;print(json.load(open('out/blocklist/latest.json'))['total_domains'])")
+          curl -fsS -X POST "$WORKER_URL/published" \
+            -H "Authorization: Bearer $WORKER_SECRET" \
+            -H "Content-Type: application/json" \
+            -d "{\"version\":\"$VERSION\",\"total_domains\":$TOTAL}"

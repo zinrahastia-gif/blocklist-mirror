@@ -1,0 +1,24 @@
+# Build output. Each snapshot is ~40 MB and each diff another few KB; committing
+# them would bloat the repo permanently since git keeps every blob forever.
+# They belong in Releases, not in history.
+out/
+*.csv.zst
+*.txt.zst
+
+# Worker build artifacts
+worker/dist/
+worker/.wrangler/
+node_modules/
+
+# Local scratch
+.download.tmp
+*.log
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Credentials must never be committed
+.env
+.env.*
+*.pem

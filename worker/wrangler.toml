@@ -1,0 +1,26 @@
+name = "blocklist-detector"
+main = "src/index.js"
+compatibility_date = "2026-01-01"
+
+# Workers Free: 10ms CPU per cron trigger, 128MB memory.
+# This worker only does HEAD requests, so CPU is ~0 - all the time is network
+# wait, which Cloudflare does not bill as CPU. The actual build (224MB download
+# + compression) needs ~40x the free memory, so it runs on GitHub Actions and
+# is started by repository_dispatch from here.
+[triggers]
+crons = ["*/5 * * * *"]
+
+# State: last-seen etag/last-modified per source, plus dispatch history.
+[[kv_namespaces]]
+binding = "STATE"
+id = "af3c0d930fdb4ae5b141042327fd7340"
+
+[vars]
+GITHUB_REPO = "YOURUSER/YOURREPO"
+# Where the public files are served from. GitHub Releases needs no card and is
+# free for public repos, so it replaces R2 entirely for this project.
+PUBLIC_BASE = "https://github.com/YOURUSER/YOURREPO/releases/download/blocklist"
+
+# Set these as secrets, never here:
+#   npx wrangler secret put GITHUB_TOKEN     # fine-grained PAT, Contents: read+write
+#   npx wrangler secret put WORKER_SECRET    # any random string the build job sends back
