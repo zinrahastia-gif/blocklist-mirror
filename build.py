@@ -30,7 +30,7 @@ import shutil
 import sys
 import time
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 
 import zstandard as zstd
@@ -38,6 +38,10 @@ import zstandard as zstd
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "out")
 BL = os.path.join(OUT, "blocklist")
+
+# Every user-facing date in this project is GMT+7 (WIB). Pinned rather than a
+# local-timezone lookup so a build on a UTC runner produces identical ids.
+WIB = timezone(timedelta(hours=7))
 
 ZSTD_LEVEL = 19          # ~4.7x on this corpus; matches upstream's 223MB -> 47MB
 ZSTD_THREADS = 0         # 0 = single thread, deterministic output bytes
@@ -294,14 +298,23 @@ def build(source_path: str, source_label: str, last_mod: str) -> dict:
     os.makedirs(vdir, exist_ok=True)
     os.makedirs(ddir, exist_ok=True)
 
+    # The version prefix is the source's calendar date in GMT+7, not UTC.
+    # The HTTP Last-Modified header is always GMT, and between 00:00 and 07:00
+    # WIB it names the PREVIOUS day -- so a build published at 06:04 on 1 Nov
+    # would be stamped 20261031 under raw UTC, which is what happened to the
+    # existing build. Converting first keeps the date consistent with every
+    # other timestamp shown to a user.
     stamp = datetime.strptime(last_mod, "%a, %d %b %Y %H:%M:%S %Z")
+    stamp_wib = stamp.replace(tzinfo=timezone.utc).astimezone(WIB)
     tmp = os.path.join(vdir, ".incoming.zst")
     sha, size = write_zst(domains, tmp)
-    version = f"{stamp:%Y%m%d}-{sha[:16]}"
+    version = f"{stamp_wib:%Y%m%d}-{sha[:16]}"
     final = os.path.join(vdir, f"{version}.csv.zst")
     shutil.move(tmp, final)
     print(f"  compressed -> {size:,} bytes ({size / 1048576:.2f} MB), "
           f"ratio {os.path.getsize(source_path) / size:.2f}x")
+    print(f"  source time {stamp:%Y-%m-%d %H:%M:%S} GMT = "
+          f"{stamp_wib:%Y-%m-%d %H:%M:%S} GMT+7")
     print(f"  version = {version}")
 
     prev = previous_version(last_mod)
