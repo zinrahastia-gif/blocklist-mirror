@@ -102,6 +102,39 @@ async function dispatchBuild(env, trigger) {
   return { ok: res.status === 204, status: res.status, body: await res.text() };
 }
 
+/** Ask GitHub for the asset size and release date of a version.
+ *
+ *  Why the Worker does this instead of trusting the build callback: the
+ *  workflow's callback payload only carries version + domain count, and
+ *  updating the workflow itself needs the `workflows` token scope. Fetching
+ *  the metadata here keeps `latest.json` complete without touching CI.
+ *  Failure is non-fatal -- the manifest degrades to zeros, it never breaks.
+ */
+async function fetchReleaseMeta(env, version) {
+  try {
+    const res = await fetch(
+      `https://api.github.com/repos/${env.GITHUB_REPO}/releases/tags/${encodeURIComponent(version)}`,
+      {
+        headers: {
+          Authorization: `Bearer ${env.GITHUB_TOKEN}`,
+          Accept: "application/vnd.github+json",
+          "User-Agent": UA,
+        },
+        signal: AbortSignal.timeout(8000),
+      }
+    );
+    if (!res.ok) return null;
+    const rel = await res.json();
+    const asset = (rel.assets || []).find((a) => a.name === `${version}.csv.zst`);
+    return {
+      sizeBytes: asset?.size ?? null,
+      lastModified: rel.published_at ?? null,
+    };
+  } catch {
+    return null;
+  }
+}
+
 /** skiddle-shaped manifest. `file` is RELATIVE on purpose: clients do
  *  BASE_URL + file, and this Worker answers that path with a 302. */
 function manifestOf(p) {
@@ -122,6 +155,95 @@ async function loadState(env) {
 const json = (obj, status = 200) =>
   new Response(JSON.stringify(obj, null, 2), { status, headers: JSON_HEADERS });
 
+/** Format an RFC1123 GMT timestamp as GMT+7, for the index page.
+ *  The source data is always GMT; every human-facing time in this project is
+ *  GMT+7 (WIB). Converting server-side keeps the page honest even with JS off. */
+function toGmt7(rfc1123) {
+  if (!rfc1123) return "-";
+  const t = Date.parse(rfc1123);
+  if (Number.isNaN(t)) return rfc1123;
+  // Asia/Bangkok is UTC+7 year-round; no DST, so a fixed offset is correct.
+  const d = new Date(t + 7 * 3600 * 1000);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ` +
+         `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
+}
+
+function fmtBytes(n) {
+  if (!n) return "-";
+  const u = ["B", "KB", "MB", "GB"];
+  let i = 0, v = n;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return `${v.toFixed(2)} ${u[i]}`;
+}
+
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
+  (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+/** Server-rendered index. Same information as blocklist.skiddle.id's page, but
+ *  rendered from KV instead of fetched client-side, so it works with no JS and
+ *  cannot disagree with latest.json (both read the same KV entry). */
+function renderIndex(env, state) {
+  const pub = state.published ?? null;
+  const hist = state.publishedHistory ?? [];
+
+  const latestCard = pub?.version
+    ? `<div class="card">
+    <h2>Latest Blocklist</h2>
+    <p><strong>Version:</strong> ${esc(pub.version)}</p>
+    <p><strong>Total Domains:</strong> ${(pub.totalDomains ?? 0).toLocaleString("en-US")}</p>
+    <p><strong>Size:</strong> ${fmtBytes(pub.sizeBytes)}</p>
+    <p><strong>Last Modified:</strong> ${toGmt7(pub.lastModified)} GMT+7</p>
+    <a class="btn" href="/latest">Download Latest (.csv.zst)</a>
+  </div>`
+    : `<div class="card"><h2>Latest Blocklist</h2><p>No build published yet.</p></div>`;
+
+  // Newest first. history is maintained newest-first by /published, but sort
+  // defensively so a manual KV edit cannot produce a shuffled table.
+  const rows = [...hist]
+    .sort((a, b) => Date.parse(b.lastModified ?? 0) - Date.parse(a.lastModified ?? 0))
+    .map((v) => `<tr>
+      <td>${esc(v.version)}</td>
+      <td>${(v.totalDomains ?? 0).toLocaleString("en-US")}</td>
+      <td>${fmtBytes(v.sizeBytes)}</td>
+      <td>${toGmt7(v.lastModified)}</td>
+      <td><a href="${BASE_PATH}/versions/${esc(v.version)}.csv.zst">Download</a></td>
+    </tr>`).join("");
+
+  const table = rows || `<tr><td colspan="5">No versions yet.</td></tr>`;
+
+  return `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Blocklist Downloads</title>
+<style>
+body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;max-width:900px;margin:40px auto;padding:0 20px;color:#111}
+h1{margin-bottom:.5rem}h2{margin-bottom:.5rem}
+.muted{color:#666;font-size:13px}
+.card{border:1px solid #ddd;border-radius:10px;padding:18px;margin-bottom:28px;box-shadow:0 1px 3px rgba(0,0,0,.05)}
+.btn{display:inline-block;padding:10px 18px;margin-top:14px;background:#007bff;color:#fff;text-decoration:none;border-radius:6px;font-weight:500}
+.btn:hover{background:#0056b3}
+table{width:100%;border-collapse:collapse;margin-top:14px;font-size:14px}
+th,td{border-bottom:1px solid #e0e0e0;padding:10px;text-align:left}
+th{background:#f5f5f5;font-weight:600}
+code{background:#f3f3f3;padding:3px 6px;border-radius:4px;word-break:break-all}
+</style></head><body>
+<h1>&#128230; Blocklist Downloads</h1>
+<p class="muted">All timestamps are shown in <strong>GMT+7</strong>. Detected from GitHub within 5 minutes.</p>
+${latestCard}
+<div class="card">
+  <h2>All Versions</h2>
+  <table>
+    <thead><tr><th>Version</th><th>Total Domains</th><th>Size</th><th>Last Modified (GMT+7)</th><th>Download</th></tr></thead>
+    <tbody>${table}</tbody>
+  </table>
+</div>
+<p class="muted">Manifest: <a href="${BASE_PATH}/latest.json">latest.json</a> &middot; <a href="${BASE_PATH}/versions.json">versions.json</a></p>
+</body></html>`;
+}
+
+const BASE_PATH = "/blocklist";
+
 export default {
   async scheduled(controller, env, ctx) {
     ctx.waitUntil(checkAndTrigger(env, "cron"));
@@ -132,6 +254,16 @@ export default {
     const path = url.pathname;
     const state = await loadState(env);
     const pub = state.published ?? null;
+
+    // ---- index page --------------------------------------------------------
+    if (path === "/" || path === "/index.html" || path === "/blocklist/") {
+      // Rendered from the same KV entry that latest.json reads, so the page and
+      // the manifest can never disagree -- the exact desync that made the old
+      // mirror advertise a build its versions table omitted.
+      return new Response(renderIndex(env, state), {
+        headers: { "content-type": "text/html; charset=utf-8", "cache-control": "public, max-age=60" },
+      });
+    }
 
     // ---- client API: skiddle-compatible ------------------------------------
     if (path === "/blocklist/latest.json") {
@@ -174,9 +306,22 @@ export default {
         lastModified: body.last_modified ?? null,
         at: new Date().toISOString(),
       };
+      // Fill any missing fields from the release itself so latest.json is
+      // complete even when an older workflow sends only version + count.
+      if (entry.sizeBytes == null || entry.lastModified == null) {
+        const meta = await fetchReleaseMeta(env, entry.version);
+        if (meta) {
+          entry.sizeBytes ??= meta.sizeBytes;
+          entry.lastModified ??= meta.lastModified;
+        }
+      }
       const hist = (state.publishedHistory ?? []).filter((p) => p.version !== entry.version);
       hist.unshift(entry);
-      const next = { ...state, published: entry, publishedHistory: hist.slice(0, HISTORY_LIMIT) };
+      // Drop the legacy Komdigi probe record: it was written by an older build
+      // of this Worker and nothing reads it any more. Leaving it in KV makes
+      // /status look like we still contact that host.
+      const { komdigi: _dropped, ...rest } = state;
+      const next = { ...rest, published: entry, publishedHistory: hist.slice(0, HISTORY_LIMIT) };
       await env.STATE.put(STATE_KEY, JSON.stringify(next));
       return json({ ok: true, published: entry, manifest: manifestOf(entry) });
     }
