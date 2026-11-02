@@ -126,9 +126,21 @@ async function fetchReleaseMeta(env, version) {
     if (!res.ok) return null;
     const rel = await res.json();
     const asset = (rel.assets || []).find((a) => a.name === `${version}.csv.zst`);
+    // GitHub publishes `digest: "sha256:<hex>"` on every release asset. That is
+    // the hash of the uploaded bytes -- exactly the sha256 the manifest
+    // promises -- so the Worker can fill it in even though the build callback
+    // only sends version + total_domains.
+    const digest = (asset?.digest || "").replace(/^sha256:/, "") || null;
     return {
       sizeBytes: asset?.size ?? null,
-      lastModified: rel.published_at ?? null,
+      sha256: digest,
+      // NOT rel.published_at: the builder workflow deletes and recreates its
+      // release every run, and a recreated tag keeps the date the tag object was
+      // first made. Measured 2026-11-02 on our own release: asset.updated_at
+      // 01:22:39Z vs published_at 2026-11-01T17:42:47Z -- 7.6 hours of drift
+      // shown to every client reading last_modified. The asset timestamp is the
+      // one that actually tracks the file.
+      lastModified: asset?.updated_at ?? rel.published_at ?? null,
     };
   } catch {
     return null;
@@ -306,13 +318,17 @@ export default {
         lastModified: body.last_modified ?? null,
         at: new Date().toISOString(),
       };
-      // Fill any missing fields from the release itself so latest.json is
-      // complete even when an older workflow sends only version + count.
-      if (entry.sizeBytes == null || entry.lastModified == null) {
+      // Fill MISSING fields from the release itself so latest.json is complete
+      // even when an older workflow sends only version + count. Three fields can
+      // be absent: size_bytes, last_modified and sha256. sha256 must be included
+      // -- the current workflow never sends it, so without this the manifest
+      // advertises `"sha256": null` for a file whose hash GitHub already knows.
+      if (entry.sizeBytes == null || entry.lastModified == null || entry.sha256 == null) {
         const meta = await fetchReleaseMeta(env, entry.version);
         if (meta) {
           entry.sizeBytes ??= meta.sizeBytes;
           entry.lastModified ??= meta.lastModified;
+          entry.sha256 ??= meta.sha256;
         }
       }
       const hist = (state.publishedHistory ?? []).filter((p) => p.version !== entry.version);
@@ -335,7 +351,7 @@ export default {
       return json({
         state,
         source: SOURCE,
-        note: "HEAD-only detector every 5 min; build runs on GitHub Actions. No Komdigi contact.",
+        note: "HEAD-only detector every 10 min; build runs on GitHub Actions. No Komdigi contact.",
       });
     }
 
