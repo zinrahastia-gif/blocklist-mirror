@@ -62,6 +62,29 @@ class SourceRejected(Exception):
     """Raised when the upstream payload is not a usable domain list."""
 
 
+# Upstream publishes its blocklist TWO ways, and they drift apart:
+#   releases/download/latest/domains.txt   single merged asset, refreshed by a
+#                                          bot on its own schedule
+#   repo tree domains_001.txt .. domains_NN.txt
+#                                          written by the crawler the moment it
+#                                          finishes a pass
+# Measured 2026-11-03: the release asset held 10,015,061 domains while the tree
+# union held 10,022,816 -- the release was missing 7,759 freshly-blocked
+# domains, every one of them a brand-new gambling site. The tree is the truth;
+# the release lags it. So the tree is the default source.
+TREE_REPO = "Skiddle-ID/blocklist"
+TREE_REF = "main"
+# Shards are capped at exactly 50 MiB each by upstream's splitter. The moment a
+# shard hits the cap the splitter starts writing the NEXT numbered file, so the
+# count is never hardcoded here -- it is discovered from the GitHub contents API
+# on every run. A hardcoded 001..005 list silently loses a whole shard (and a
+# chunk of the blocklist) the day domains_006.txt appears.
+TREE_SHARD_CAP = 52428800
+TREE_API = f"https://api.github.com/repos/{TREE_REPO}/contents/"
+TREE_RAW = f"https://raw.githubusercontent.com/{TREE_REPO}/{TREE_REF}/"
+SHARD_RE = re.compile(r"^domains_(\d+)\.txt$")
+
+
 # --------------------------------------------------------------------------- io
 
 def fetch(url: str, dest: str, timeout: int = 900) -> tuple[str, int]:
@@ -99,6 +122,117 @@ def fetch(url: str, dest: str, timeout: int = 900) -> tuple[str, int]:
 def read_lines(path: str) -> list[str]:
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
         return [ln.strip() for ln in fh if ln.strip()]
+
+
+# --------------------------------------------------------------- upstream tree
+
+def _get_json(url: str, timeout: int = 120):
+    req = urllib.request.Request(url, headers={
+        "User-Agent": UA,
+        "Accept": "application/vnd.github+json",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        if resp.status != 200:
+            raise SourceRejected(f"HTTP {resp.status} from {url}")
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def discover_shards() -> list[dict]:
+    """List every domains_NNN.txt in the upstream tree, ascending, with sizes.
+
+    Discovery is the whole point: upstream's splitter rolls to a new numbered
+    shard whenever the current one reaches 50 MiB. Reading the live file list
+    means domains_006.txt is picked up on the run after it is created, instead
+    of being silently ignored until someone edits a hardcoded range.
+    """
+    listing = _get_json(f"{TREE_API}?ref={TREE_REF}")
+    if not isinstance(listing, list):
+        raise SourceRejected("unexpected contents API payload (not a listing)")
+    shards = []
+    for entry in listing:
+        if entry.get("type") != "file":
+            continue
+        m = SHARD_RE.match(entry.get("name", ""))
+        if m:
+            shards.append({"num": int(m.group(1)),
+                           "name": entry["name"],
+                           "size": int(entry.get("size") or 0)})
+    if not shards:
+        raise SourceRejected(
+            f"no domains_NNN.txt files found in {TREE_REPO}@{TREE_REF}; "
+            "upstream layout changed, refusing to publish a partial blocklist")
+    shards.sort(key=lambda s: s["num"])
+    nums = [s["num"] for s in shards]
+    if nums != list(range(nums[0], nums[0] + len(nums))):
+        print(f"  WARNING: shard numbering has a gap: {nums}", file=sys.stderr)
+    return shards
+
+
+def report_shard_health(shards: list[dict]) -> None:
+    """Log how full each shard is and warn before the splitter rolls over.
+
+    Upstream splits on a hard 50 MiB ceiling, so a shard sitting at 100% means
+    the next shard is about to appear. Printing this every run turns an
+    invisible upstream change into a visible one.
+    """
+    for s in shards:
+        pct = s["size"] / TREE_SHARD_CAP * 100
+        state = "FULL" if s["size"] >= TREE_SHARD_CAP else f"{pct:.0f}%"
+        print(f"    {s['name']}: {s['size']:>11,} bytes {state}")
+    tail = shards[-1]
+    if tail["size"] >= TREE_SHARD_CAP:
+        print(f"  NOTICE: tail shard {tail['name']} is at the 50 MiB cap - "
+              f"upstream will open domains_{tail['num'] + 1:03d}.txt next; "
+              f"it is picked up automatically on the next run.")
+    elif tail["size"] / TREE_SHARD_CAP > 0.85:
+        free = TREE_SHARD_CAP - tail["size"]
+        print(f"  NOTICE: tail shard {tail['name']} is {tail['size'] / TREE_SHARD_CAP * 100:.1f}% "
+              f"full ({free:,} bytes left before the splitter opens the next shard)")
+
+
+def fetch_tree(out_path: str, workdir: str) -> tuple[str, int]:
+    """Download every upstream shard and write their union to out_path.
+
+    Returns (Last-Modified of the newest shard, bytes written), matching the
+    shape of fetch() so the rest of build() is unchanged. The newest shard's
+    Last-Modified is the correct "source time": a crawl that only appends to the
+    tail leaves the earlier shards untouched, and their headers would otherwise
+    date the whole snapshot to a stale build.
+    """
+    shards = discover_shards()
+    print(f"  upstream tree {TREE_REPO}@{TREE_REF}: {len(shards)} shard(s) "
+          f"{shards[0]['name']}..{shards[-1]['name']}")
+    report_shard_health(shards)
+
+    newest_mod = None
+    newest_dt = None
+    total_in = 0
+    for s in shards:
+        dest = os.path.join(workdir, s["name"])
+        mod, written = fetch(TREE_RAW + s["name"], dest, timeout=1800)
+        total_in += written
+        if s["size"] and written != s["size"]:
+            raise SourceRejected(
+                f"{s['name']}: contents API said {s['size']:,} bytes but "
+                f"{written:,} arrived; upstream was writing mid-download")
+        dt = datetime.strptime(mod, "%a, %d %b %Y %H:%M:%S %Z")
+        if newest_dt is None or dt > newest_dt:
+            newest_dt, newest_mod = dt, mod
+
+    # Union, not concatenation: upstream shards are independently generated and
+    # can overlap. Concatenating would inflate the raw line count (and trip the
+    # malformed-ratio validator on nothing) before normalise() deduped it.
+    seen: set[str] = set()
+    for s in shards:
+        seen.update(read_lines(os.path.join(workdir, s["name"])))
+        os.remove(os.path.join(workdir, s["name"]))
+    print(f"  union of {len(shards)} shards -> {len(seen):,} unique domains "
+          f"from {total_in:,} shard bytes")
+
+    blob = "".join(d + "\n" for d in seen)
+    with open(out_path, "wb") as fh:
+        fh.write(blob.encode())
+    return newest_mod or format_datetime(datetime.now(timezone.utc), usegmt=True), len(blob)
 
 
 # ------------------------------------------------------------------- validation
@@ -390,36 +524,44 @@ def build(source_path: str, source_label: str, last_mod: str) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--source", help="URL or local file to ingest")
+    ap.add_argument("--source", help="URL or local file to ingest "
+                                     "(default: upstream tree union)")
     ap.add_argument("--label", default="", help="human label for logs")
     args = ap.parse_args()
-    if not args.source:
-        ap.error("--source is required")
 
     os.makedirs(BL, exist_ok=True)
     src = args.source
-    local = not src.lower().startswith(("http://", "https://"))
-    print(f"[build] source: {args.label or src}")
+    print(f"[build] source: {args.label or src or 'upstream tree union'}")
 
-    if local:
-        if not os.path.exists(src):
-            print(f"  missing local file: {src}", file=sys.stderr)
-            return 2
-        mtime = datetime.fromtimestamp(os.path.getmtime(src), timezone.utc)
-        last_mod = format_datetime(mtime, usegmt=True)
-        path = src
-        print(f"  local file {os.path.getsize(src):,} bytes (mtime {last_mod})")
-    else:
+    if not src:
+        # Default path: the upstream repo tree, shard-discovered. This is the
+        # freshest source -- see the TREE_REPO comment for the measured gap.
         path = os.path.join(HERE, ".download.tmp")
-        last_mod, _ = fetch(src, path)
+        last_mod, _ = fetch_tree(path, HERE)
+        local = True          # already on disk; build() just reads it
+    else:
+        local = not src.lower().startswith(("http://", "https://"))
+        if local:
+            if not os.path.exists(src):
+                print(f"  missing local file: {src}", file=sys.stderr)
+                return 2
+            mtime = datetime.fromtimestamp(os.path.getmtime(src), timezone.utc)
+            last_mod = format_datetime(mtime, usegmt=True)
+            path = src
+            print(f"  local file {os.path.getsize(src):,} bytes (mtime {last_mod})")
+        else:
+            path = os.path.join(HERE, ".download.tmp")
+            last_mod, _ = fetch(src, path)
 
     try:
-        latest = build(path, args.label or src, last_mod)
+        latest = build(path, args.label or src or "upstream tree union", last_mod)
     except SourceRejected as exc:
         print(f"\n  SOURCE REJECTED: {exc}", file=sys.stderr)
         return 1
     finally:
-        if not local and os.path.exists(path):
+        # The tree path writes .download.tmp itself; the URL path wrote it via
+        # fetch(). Either way it is a scratch file once build() has read it.
+        if os.path.exists(path) and (not local or not src):
             os.remove(path)
 
     print(f"\n[build] OK {latest['version']} "
