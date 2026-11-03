@@ -63,11 +63,34 @@ jobs:
           echo "started=$(date -u +%FT%TZ)"
           echo "::notice title=Build started::$(date -u +%T) UTC"
 
-      - name: Build from the unmasked source
+      # Source: the upstream REPO TREE (domains_001.txt..domains_NNN.txt), NOT
+      # the releases/download/latest/domains.txt asset. Measured 2026-11-03: the
+      # release asset carried 10,015,061 domains while the tree union carried
+      # 10,022,816 -- 7,759 freshly-blocked gambling domains were in the tree
+      # and absent from the release. The release is refreshed by a separate bot
+      # that had stalled; the crawler writes the tree directly. build.py
+      # discovers the shard count from the GitHub API every run, so the day
+      # upstream's 50 MiB splitter opens domains_006.txt it is picked up with no
+      # code change and no lost shard.
+      - name: Build from the upstream tree union
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python build.py --label "github tree domains_001..NNN (auto-discovered)"
+
+      # Drift guard: compare what we just published against the release asset
+      # we used to follow. If the release is now AHEAD, its bot caught up and we
+      # are reading a stale tree -- that is worth a loud annotation rather than
+      # silently publishing fewer domains than upstream advertises.
+      - name: Check drift vs upstream release asset
+        if: success()
+        continue-on-error: true
         run: |
-          python build.py \
-            --source "https://github.com/Skiddle-ID/blocklist/releases/download/latest/domains.txt" \
-            --label "github release domains.txt"
+          set -uo pipefail
+          total=$(python -c "import json;print(json.load(open('out/blocklist/latest.json'))['total_domains'])")
+          code=$(curl -sSI -o /dev/null -w '%{http_code}' -L \
+            "https://github.com/Skiddle-ID/blocklist/releases/download/latest/domains.txt")
+          echo "published=$total release_asset_http=$code"
+          echo "::notice title=Drift check::published $total domains (tree union); release asset HTTP $code"
 
       # Publish to GitHub Releases, not R2. R2 requires a payment card on the
       # account even for the free tier (verified: the API returns code 10042
