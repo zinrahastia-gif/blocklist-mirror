@@ -1,10 +1,19 @@
 // Cloudflare Worker: blocklist API, 5-minute change detector, and file redirect.
 //
 // NO KOMDIGI. This Worker only ever talks to github.com:
-//   - HEAD the upstream mirror's release asset to detect change
-//   - POST repository_dispatch to start a build
+//   - poll the upstream repo TREE (domains_001.txt..domains_NNN.txt) via the
+//     GitHub contents API and fingerprint every shard's blob sha + size
+//   - POST repository_dispatch to start a build when that fingerprint changes
 //   - serve latest.json / versions.json shaped exactly like blocklist.skiddle.id
-//   - 302 redirect to the release asset when a client asks for a .csv.zst
+//   - 302 redirect to our release asset when a client asks for a .csv.zst
+//
+// WHY THE TREE, NOT THE RELEASE ASSET
+//   Upstream publishes two ways and they drift: the crawler writes the tree the
+//   moment a pass finishes, while releases/download/latest/domains.txt is
+//   refreshed by a separate bot. Measured 2026-11-03 that asset was missing
+//   7,759 domains that were already in the tree. Watching the asset meant the
+//   mirror inherited that lag AND its detector never fired for tree-only
+//   updates, so the mirror could sit stale indefinitely while upstream moved.
 //
 // WHY THE BUILD IS NOT HERE
 //   Workers Free = 10 ms CPU per cron trigger, 128 MB memory. The build needs
@@ -26,37 +35,76 @@
 //   GET  /check[?force=1]                        run a detection tick now
 //   POST /published                              build job callback (secret)
 
-const SOURCE = "https://github.com/Skiddle-ID/blocklist/releases/download/latest/domains.txt";
+const UPSTREAM_REPO = "Skiddle-ID/blocklist";
+const UPSTREAM_REF = "main";
+const TREE_API = `https://api.github.com/repos/${UPSTREAM_REPO}/contents/?ref=${UPSTREAM_REF}`;
+/** What we watch. Kept in /status output so an operator can see the source. */
+const SOURCE = `https://github.com/${UPSTREAM_REPO}/tree/${UPSTREAM_REF} (domains_NNN.txt, contents API)`;
+const SHARD_RE = /^domains_(\d+)\.txt$/;
+/** Upstream's splitter caps each shard at 50 MiB, then opens the next number. */
+const SHARD_CAP = 52428800;
 const STATE_KEY = "source_state";
 
 const UA = "blocklist-mirror/1.0 (+https://github.com/zinrahastia-gif/blocklist-mirror)";
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
 const HISTORY_LIMIT = 40;   // ~40 days at one publish per day;
 
-/** HEAD a URL and return the change markers. Never downloads a body.
+/** List the upstream shards and hash their identity into one fingerprint.
  *
- *  retries: a single failure must not be read as "unchanged", or the pipeline
- *  would silently stop forever. Only after the budget is spent do we report
- *  ok:false, and the caller then leaves state untouched for the next tick.
+ *  The contents API returns each file's git blob sha and byte size, so a single
+ *  request tells us whether ANY shard changed without downloading 224 MB. The
+ *  fingerprint is `<name>:<size>:<blobSha>` joined across all shards in order,
+ *  SHA-256ed. That means three changes are all detected:
+ *    - a shard's content changed      (blob sha differs)
+ *    - a shard grew                   (size differs)
+ *    - a NEW shard appeared           (the join gets longer)
+ *  The last one matters most: upstream's splitter opens domains_006.txt when
+ *  005 hits the 50 MiB cap, and a hardcoded probe of 001..005 would look
+ *  "unchanged" forever while a third of a million domains went unpublished.
+ *
+ *  Authenticated with the same PAT used for dispatch: unauthenticated API calls
+ *  are rate-limited to 60/hour per IP, and a 5-minute poll is 288/day.
  */
-async function probe(url, { retries = 3, timeoutMs = 8000 } = {}) {
+async function probeTree(env, { retries = 3, timeoutMs = 8000 } = {}) {
   let lastErr = "unknown";
   for (let attempt = 1; attempt <= retries; attempt++) {
     const started = Date.now();
     try {
-      const res = await fetch(url, {
-        method: "HEAD",
-        headers: { "User-Agent": UA },
-        redirect: "follow",
+      const res = await fetch(TREE_API, {
+        headers: {
+          "User-Agent": UA,
+          Accept: "application/vnd.github+json",
+          ...(env?.GITHUB_TOKEN ? { Authorization: `Bearer ${env.GITHUB_TOKEN}` } : {}),
+        },
         signal: AbortSignal.timeout(timeoutMs),
         cf: { cacheTtl: 0, cacheEverything: false },
       });
+      if (!res.ok) return { ok: false, status: res.status, ms: Date.now() - started, attempts: attempt };
+      const listing = await res.json();
+      if (!Array.isArray(listing)) return { ok: false, status: 0, error: "not a listing", attempts: attempt };
+      const shards = listing
+        .filter((e) => e?.type === "file" && SHARD_RE.test(e.name || ""))
+        .map((e) => ({
+          num: Number(SHARD_RE.exec(e.name)[1]),
+          name: e.name,
+          size: Number(e.size || 0),
+          sha: String(e.sha || ""),
+        }))
+        .sort((a, b) => a.num - b.num);
+      if (!shards.length) return { ok: false, status: 0, error: "no shards found", attempts: attempt };
+      const raw = shards.map((s) => `${s.name}:${s.size}:${s.sha}`).join("|");
+      const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(raw)));
+      const fingerprint = [...digest].map((b) => b.toString(16).padStart(2, "0")).join("");
+      const tail = shards[shards.length - 1];
       return {
-        ok: res.ok,
-        status: res.status,
-        etag: res.headers.get("etag"),
-        lastModified: res.headers.get("last-modified"),
-        contentLength: Number(res.headers.get("content-length") || 0),
+        ok: true,
+        status: 200,
+        fingerprint,
+        shardCount: shards.length,
+        shards,
+        totalBytes: shards.reduce((n, s) => n + s.size, 0),
+        tailShard: tail.name,
+        tailPct: Math.round((tail.size / SHARD_CAP) * 10000) / 100,
         ms: Date.now() - started,
         attempts: attempt,
       };
@@ -68,20 +116,9 @@ async function probe(url, { retries = 3, timeoutMs = 8000 } = {}) {
   return { ok: false, status: 0, error: lastErr, attempts: retries };
 }
 
-/** Two samples are equal when every marker matches. A missing marker on both
- *  sides counts as equal (some endpoints omit etag); a missing one on only one
- *  side counts as a change, which errs toward rebuilding rather than missing. */
-function same(a, b) {
-  if (!a || !b) return false;
-  const fields = ["etag", "lastModified", "contentLength"];
-  let compared = 0;
-  for (const f of fields) {
-    if (a[f] === undefined || b[f] === undefined) continue;
-    if (!a[f] && !b[f]) continue;
-    compared++;
-    if (String(a[f]) !== String(b[f])) return false;
-  }
-  return compared > 0;
+/** True when two tree fingerprints describe the same upstream state. */
+function sameTree(a, b) {
+  return Boolean(a?.fingerprint && b?.fingerprint && a.fingerprint === b.fingerprint);
 }
 
 async function dispatchBuild(env, trigger) {
@@ -351,7 +388,7 @@ export default {
       return json({
         state,
         source: SOURCE,
-        note: "HEAD-only detector every 10 min; build runs on GitHub Actions. No Komdigi contact.",
+        note: "Tree-fingerprint detector every 5 min: polls Skiddle-ID/blocklist contents API (domains_001..NNN blob shas+sizes) and dispatches a GitHub Actions build on any change, including a new shard appearing. No Komdigi contact.",
       });
     }
 
@@ -361,48 +398,54 @@ export default {
 
 async function checkAndTrigger(env, trigger, force = false) {
   const now = new Date().toISOString();
-  const gh = await probe(SOURCE);
+  const tree = await probeTree(env);
 
-  if (!gh.ok) {
+  if (!tree.ok) {
     const prev = await loadState(env);
     await env.STATE.put(STATE_KEY, JSON.stringify({
-      ...prev, lastCheck: now, lastError: `source HEAD ${gh.status || gh.error}`,
+      ...prev, lastCheck: now, lastError: `tree probe ${tree.status || tree.error}`,
     }));
-    return { changed: false, error: `source HEAD ${gh.status || gh.error}` };
+    return { changed: false, error: `tree probe ${tree.status || tree.error}` };
   }
 
   const prev = await loadState(env);
-  const changed = force || !same(prev.github ?? null, gh);
+  const prevTree = prev.tree ?? null;
+  const changed = force || !sameTree(prevTree, tree);
 
-  // Guard: a cron tick must not re-dispatch for an etag that already produced a
-  // build. Without this, every tick while upstream is static burns a ~2 minute
-  // Actions run that resolves to the same content hash and the same version id.
-  if (trigger === "cron" && prev.lastBuiltEtag && prev.lastBuiltEtag === gh.etag && !force) {
-    await env.STATE.put(STATE_KEY, JSON.stringify({ ...prev, lastCheck: now, github: gh }));
-    return { changed: false, reason: "same etag already built", lastCheck: now, markers: gh };
+  // Guard: a cron tick must not re-dispatch for a tree state that already
+  // produced a build. Without this, every tick while upstream is static burns
+  // a ~2 minute Actions run that resolves to the same content hash and the
+  // same version id. This compares fingerprint, not a single file's etag, so
+  // it cannot be fooled by a change confined to one shard.
+  if (trigger === "cron" && prev.lastBuiltFingerprint && prev.lastBuiltFingerprint === tree.fingerprint && !force) {
+    await env.STATE.put(STATE_KEY, JSON.stringify({ ...prev, lastCheck: now, tree, lastBuiltFingerprint: tree.fingerprint }));
+    return { changed: false, reason: "same tree fingerprint already built", lastCheck: now, markers: tree };
   }
 
   const next = {
     ...prev,
     lastCheck: now,
-    github: gh,
+    tree,
     changeCount: (prev.changeCount ?? 0) + (changed ? 1 : 0),
   };
 
   if (!changed) {
     await env.STATE.put(STATE_KEY, JSON.stringify(next));
-    return { changed: false, lastCheck: now, markers: gh };
+    return { changed: false, lastCheck: now, markers: tree };
   }
 
   const result = await dispatchBuild(env, trigger);
   next.lastDispatch = {
     at: now, trigger, ok: result.ok, status: result.status,
-    forEtag: gh.etag, forLastModified: gh.lastModified,
+    forFingerprint: tree.fingerprint,
+    shardCount: tree.shardCount,
+    tailShard: tree.tailShard,
+    tailPct: tree.tailPct,
   };
-  // Record the built etag only on success; on failure the next tick must retry,
-  // otherwise a single 401 would silence the pipeline permanently.
-  if (result.ok) next.lastBuiltEtag = gh.etag;
+  // Record the built fingerprint only on success; on failure the next tick
+  // must retry, otherwise a single 401 would silence the pipeline permanently.
+  if (result.ok) next.lastBuiltFingerprint = tree.fingerprint;
   await env.STATE.put(STATE_KEY, JSON.stringify(next));
 
-  return { changed: true, dispatched: result.ok, dispatchStatus: result.status, markers: gh };
+  return { changed: true, dispatched: result.ok, dispatchStatus: result.status, markers: tree };
 }
